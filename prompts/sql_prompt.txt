@@ -1,0 +1,8 @@
+The user asked: {question}
+
+We have the following tables. Use ANSI SQL compatible with DuckDB.
+{catalog}
+
+Write a single SQL query that best answers the question. Return ONLY the SQL, no commentary.
+Prefer simple column names. If dates are needed, try columns named Date, Month, or Year.
+If unsupported, return SELECT 'NO_SQL';

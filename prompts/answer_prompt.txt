@@ -1,0 +1,16 @@
+SYSTEM:
+{system}
+
+CONTEXT:
+{context}
+
+SQL_RESULT (first 200 rows):
+{sql_result}
+
+WEB_NOTES:
+{web}
+
+USER:
+{question}
+
+Answer now.
