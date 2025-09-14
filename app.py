@@ -14,8 +14,7 @@ from core.sql_assistant import SQLAssistant
 from core.llm_client import LLMClient
 from core.forecaster import Forecaster
 from prompts import system_prompt, sql_prompt, answer_prompt
-from dotenv import load_dotenv
-load_dotenv(override=True)
+from core.utils import parse_date_series
 
 
 # Optional web search
@@ -49,7 +48,6 @@ with st.sidebar:
         v = v or os.getenv(name)
         return "✅" if v else "❌"
     st.write(f"Keys → OpenAI {ok('OPENAI_API_KEY')} · Groq {ok('GROQ_API_KEY')} · DeepSeek {ok('DEEPSEEK_API_KEY')}")
-    #st.write(f"Keys: OpenAI {ok('OPENAI_API_KEY')} · Groq {ok('GROQ_API_KEY')} · DeepSeek {ok('DEEPSEEK_API_KEY')}")
     st.header("Models & Options")
     provider = st.selectbox("LLM Provider", ["openai", "groq", "deepseek", "disabled"], index=0)
     model_name = st.text_input(
@@ -60,8 +58,11 @@ with st.sidebar:
             "deepseek-reasoner" if provider=="deepseek" else ""
         )
     )
+
+    use_rag = st.checkbox("Use RAG context", value=True)
     top_k = st.slider("RAG passages (k)", 0, 10, 4)
-    use_web = st.checkbox("Augment with web search if needed", value=True)
+    sql_rows = st.slider("SQL rows passed to LLM", 50, 2000, 400, step=50)
+    use_web = st.checkbox("Augment with web if needed", value=True)
     st.divider()
     save_btn = st.button("💾 Save index to disk")
     load_btn = st.button("📂 Load index from disk")
@@ -85,6 +86,11 @@ if save_btn:
     if st.session_state.vector is None or st.session_state.ingested is None:
         st.warning("Nothing to save yet.")
     else:
+        blob_tables = {}
+        for k, v in st.session_state.ingested.tables.items():
+            buf = io.BytesIO()
+            v.to_parquet(buf, index=False)
+            blob_tables[k] = buf.getvalue()
         blob = {
             'vector': {
                 'ids': st.session_state.vector.ids,
@@ -92,7 +98,7 @@ if save_btn:
                 'model_name': st.session_state.vector.model_name,
             },
             'docs': st.session_state.ingested.corpus_docs,
-            'tables': {k: v.to_parquet(index=False) for k, v in st.session_state.ingested.tables.items()},
+            'tables': blob_tables,
         }
         with open('sustainability_index.pkl', 'wb') as f:
             pickle.dump(blob, f)
@@ -115,6 +121,7 @@ if load_btn:
     except Exception as e:
         st.error(f"Failed to load: {e}")
 
+
 # --- Catalog view ---
 if st.session_state.sql:
     with st.expander("Catalog (tables & columns)", expanded=False):
@@ -122,6 +129,27 @@ if st.session_state.sql:
 
 st.divider()
 
+# --- Catalog Explorer ---
+st.subheader("📚 Catalog Explorer")
+if st.session_state.ingested and st.session_state.ingested.tables:
+    tname = st.selectbox("Table", list(st.session_state.ingested.tables.keys()))
+    df = st.session_state.ingested.tables[tname]
+    st.write(f"Shape: {df.shape[0]} rows × {df.shape[1]} cols")
+    col = st.selectbox("Column (optional)", ["<all>"] + list(df.columns))
+    if col == "<all>":
+        st.dataframe(df.head(100))
+    else:
+        st.write("Summary:")
+        st.dataframe(pd.DataFrame({
+            'non_null': [df[col].notna().sum()],
+            'dtype': [str(df[col].dtype)],
+            'unique': [df[col].nunique()]
+        }))
+        st.dataframe(df[[col]].head(200))
+else:
+    st.info("Upload data and build the index to explore the catalog.")
+
+st.divider()
 # --- QA / RAG panel ---
 st.subheader("Ask a question ✨ (RAG + SQL + optional Web)")
 q = st.text_area("Question", placeholder="e.g., What was total GHG emissions by plant in 2024 Q1? Compare to Q1 2023.")
@@ -137,7 +165,7 @@ with c3:
 answer_box = st.empty()
 
 # --- Web search helper ---
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=True)
 def web_search_brief(query: str, max_results: int = 4) -> str:
     if not _HAS_DDG:
         return "(Web search unavailable)"
@@ -190,19 +218,19 @@ def propose_sql(question: str, sql_asst: SQLAssistant, llm: Optional[LLMClient])
 
 
 def answer_with_context(question: str, passages: List[Tuple[str,float]], sql_df: Optional[pd.DataFrame], web_notes: str, llm: Optional[LLMClient]) -> str:
-    # Build context text from retrieved ids
-    ctx_parts = []
-    if st.session_state.ingested:
+    context = ""
+    if use_rag and st.session_state.ingested:
+        ctx_parts = []
         for pid, _ in passages[:5]:
             for (doc_id, txt) in st.session_state.ingested.corpus_docs:
                 if doc_id == pid:
-                    ctx_parts.append(f"[{pid}] {txt[:1200]}")
+                    ctx_parts.append(f"[{pid}] {txt[:1800]}")
                     break
-    context = "\n\n".join(ctx_parts)
+        context = "\n\n".join(ctx_parts)
 
     sql_result = ""
     if sql_df is not None and not sql_df.empty:
-        sql_result = sql_df.head(200).to_csv(index=False)
+        sql_result = sql_df.head(800).to_csv(index=False)
 
     content = answer_prompt.format(
         system=system_prompt,
@@ -231,7 +259,7 @@ if run_rag:
     if not st.session_state.vector or not st.session_state.ingested:
         answer_box.error("Please upload data and build the index first.")
     else:
-        hits = st.session_state.vector.search(q, k=top_k) if top_k>0 else []
+        hits = st.session_state.vector.search(q, k=top_k) if (use_rag and top_k>0) else []
         web_notes = maybe_web_notes(q, len(hits), use_web)
         ans = answer_with_context(q, hits, None, web_notes, llm)
         answer_box.markdown(ans)
@@ -259,7 +287,7 @@ if exec_sql:
         except Exception as e:
             st.error(f"SQL error: {e}")
             df = None
-        hits = st.session_state.vector.search(q, k=top_k) if (st.session_state.vector and top_k>0) else []
+        hits = st.session_state.vector.search(q, k=top_k) if (use_rag and st.session_state.vector and top_k>0) else []
         web_notes = maybe_web_notes(q, len(hits), use_web)
         ans = answer_with_context(q, hits, df, web_notes, llm)
         answer_box.markdown(ans)
@@ -274,26 +302,37 @@ if st.session_state.ingested and st.session_state.ingested.tables:
     df = st.session_state.ingested.tables[tchoice]
 
     # Try construct Date from Year/Month if needed
-    if 'Month' in df.columns and 'Year' in df.columns and 'Date' not in df.columns:
-        try:
-            tmp = df.copy()
-            tmp['Date'] = pd.to_datetime(tmp['Year'].astype(str) + '-' + tmp['Month'].astype(str) + '-01', errors='coerce')
-            if tmp['Date'].notna().sum() > 0:
-                df = tmp
-                st.session_state.ingested.tables[tchoice] = df
-        except Exception:
-            pass
+    #if 'Month' in df.columns and 'Year' in df.columns and 'Date' not in df.columns:
+     #   try:
+      #      tmp = df.copy()
+       #     tmp['Date'] = pd.to_datetime(tmp['Year'].astype(str) + '-' + tmp['Month'].astype(str) + '-01', errors='coerce')
+        #    if tmp['Date'].notna().sum() > 0:
+        #        df = tmp
+         #       st.session_state.ingested.tables[tchoice] = df
+        #except Exception:
+         #   pass
 
-    num_cols = df.select_dtypes(include='number').columns.tolist()
-    dcol = st.selectbox("Date column", options=df.columns)
-    vcol = st.selectbox("Value column", options=num_cols or df.columns.tolist())
-    horizon = st.slider("Forecast horizon (periods)", 3, 36, 12)
+    
+    #num_cols = df.select_dtypes(include='number').columns.tolist()
+    #dcol = st.selectbox("Date column", options=df.columns)
+    #vcol = st.selectbox("Value column", options=num_cols or df.columns.tolist())
+    #horizon = st.slider("Forecast horizon (periods)", 3, 36, 12)
+    #season = st.number_input("Seasonal period (optional)", min_value=0, max_value=365, value=0)
+
+    # date column selection + robust coercion
+    dcol = st.selectbox("Date column", options=list(df.columns))
+    if not pd.api.types.is_datetime64_any_dtype(df[dcol]):
+        df[dcol] = parse_date_series(df[dcol])
+    vcol = st.selectbox("Value column", options=list(df.select_dtypes(include='number').columns) or list(df.columns))
+
+    model = st.selectbox("Model", ["ETS", "ARIMA", "RF"], index=0)
+    horizon = st.slider("Horizon (periods)", 3, 36, 12)
     season = st.number_input("Seasonal period (optional)", min_value=0, max_value=365, value=0)
 
     if st.button("Run Forecast"):
         try:
             fc = Forecaster(df, dcol, vcol, season if season>0 else None)
-            out, diag = fc.fit_predict(horizon=horizon)
+            out, diag = fc.fit_predict(model=model, horizon=horizon)
             st.write("**Diagnostics**", diag)
             st.line_chart(out.set_index('Date')['forecast'])
             st.dataframe(out)

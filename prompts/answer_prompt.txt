@@ -4,7 +4,7 @@ SYSTEM:
 CONTEXT:
 {context}
 
-SQL_RESULT (first 200 rows):
+SQL_RESULT (first N rows):
 {sql_result}
 
 WEB_NOTES:
