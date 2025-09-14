@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-import pmdarima as pm
+#import pmdarima as pm
 
 from .utils import parse_date_series
 
@@ -51,18 +51,18 @@ class Forecaster:
             out = pd.DataFrame({self.date_col: idx, 'forecast': fc})
             return out, diag
 
-        if model.upper() in ('ARIMA', 'ARIMAX'):
-            m = season_len if season_len > 1 else 1
-            try:
-                fit = pm.auto_arima(y, seasonal=(m>1), m=m, error_action='ignore', suppress_warnings=True)
-                fc = fit.predict(n_periods=horizon)
-                resid = y - fit.predict_in_sample()
-                diag.update({"order": str(fit.order), "seasonal_order": str(fit.seasonal_order)})
-                diag.update({"mae": float(np.mean(np.abs(resid))), "mape_%": float(np.mean(np.abs(resid/(y+1e-9)))*100)})
-                out = pd.DataFrame({self.date_col: idx, 'forecast': fc})
-                return out, diag
-            except Exception as e:
-                raise RuntimeError(f"ARIMA failed: {e}")
+        #if model.upper() in ('ARIMA', 'ARIMAX'):
+         #   m = season_len if season_len > 1 else 1
+          #  try:
+           #     fit = pm.auto_arima(y, seasonal=(m>1), m=m, error_action='ignore', suppress_warnings=True)
+            #    fc = fit.predict(n_periods=horizon)
+             #   resid = y - fit.predict_in_sample()
+              #  diag.update({"order": str(fit.order), "seasonal_order": str(fit.seasonal_order)})
+               # diag.update({"mae": float(np.mean(np.abs(resid))), "mape_%": float(np.mean(np.abs(resid/(y+1e-9)))*100)})
+                #out = pd.DataFrame({self.date_col: idx, 'forecast': fc})
+                #return out, diag
+            #except Exception as e:
+             #   raise RuntimeError(f"ARIMA failed: {e}")
 
         if model.upper() in ('RF', 'RANDOM_FOREST'):
             # Basic date features

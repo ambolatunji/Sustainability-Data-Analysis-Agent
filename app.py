@@ -14,7 +14,8 @@ from core.sql_assistant import SQLAssistant
 from core.llm_client import LLMClient
 from core.forecaster import Forecaster
 from prompts import system_prompt, sql_prompt, answer_prompt
-from core.utils import parse_date_series
+from core.utils import parse_date_series, smart_to_numeric
+
 
 
 # Optional web search
@@ -61,7 +62,7 @@ with st.sidebar:
 
     use_rag = st.checkbox("Use RAG context", value=True)
     top_k = st.slider("RAG passages (k)", 0, 10, 4)
-    sql_rows = st.slider("SQL rows passed to LLM", 50, 2000, 400, step=50)
+    sql_rows = st.slider("SQL rows passed to LLM", 5000, 10000, 20000, step=500)
     use_web = st.checkbox("Augment with web if needed", value=True)
     st.divider()
     save_btn = st.button("💾 Save index to disk")
@@ -121,12 +122,6 @@ if load_btn:
     except Exception as e:
         st.error(f"Failed to load: {e}")
 
-
-# --- Catalog view ---
-if st.session_state.sql:
-    with st.expander("Catalog (tables & columns)", expanded=False):
-        st.code(st.session_state.sql.describe())
-
 st.divider()
 
 # --- Catalog Explorer ---
@@ -134,10 +129,34 @@ st.subheader("📚 Catalog Explorer")
 if st.session_state.ingested and st.session_state.ingested.tables:
     tname = st.selectbox("Table", list(st.session_state.ingested.tables.keys()))
     df = st.session_state.ingested.tables[tname]
+    st.write("Current Datatypes:")
+    st.dataframe(pd.DataFrame({"column": df.columns, "dtype": [str(t) for t in df.dtypes]}))
+
+    num_cols_sel = st.multiselect("Cast to numeric (multi-select)", df.columns, key="cast_num")
+    date_cols_sel = st.multiselect("Cast to datetime (multi-select)", df.columns, key="cast_date")
+    text_cols_sel = st.multiselect("Cast to string (optional)", df.columns, key="cast_text")
+
+    if st.button("Apply casts"):
+        df_new = df.copy()
+        for c in num_cols_sel:
+            df_new[c] = smart_to_numeric(df_new[c])
+        for c in date_cols_sel:
+            df_new[c] = parse_date_series(df_new[c])
+        for c in text_cols_sel:
+            df_new[c] = df_new[c].astype(str)
+
+        st.session_state.ingested.tables[tname] = df_new
+        # refresh SQL engine so new dtypes are visible
+        st.session_state.sql.tables[tname] = df_new
+        st.session_state.sql.refresh()
+        st.success("Casts applied and SQL engine refreshed.")
+    else:
+        st.info("Upload data and build the index to edit dtypes.")
+
     st.write(f"Shape: {df.shape[0]} rows × {df.shape[1]} cols")
     col = st.selectbox("Column (optional)", ["<all>"] + list(df.columns))
     if col == "<all>":
-        st.dataframe(df.head(100))
+        st.dataframe(df.head(200000))
     else:
         st.write("Summary:")
         st.dataframe(pd.DataFrame({
@@ -224,13 +243,13 @@ def answer_with_context(question: str, passages: List[Tuple[str,float]], sql_df:
         for pid, _ in passages[:5]:
             for (doc_id, txt) in st.session_state.ingested.corpus_docs:
                 if doc_id == pid:
-                    ctx_parts.append(f"[{pid}] {txt[:1800]}")
+                    ctx_parts.append(f"[{pid}] {txt[:28000]}")
                     break
         context = "\n\n".join(ctx_parts)
 
     sql_result = ""
     if sql_df is not None and not sql_df.empty:
-        sql_result = sql_df.head(800).to_csv(index=False)
+        sql_result = sql_df.head(20000).to_csv(index=False)
 
     content = answer_prompt.format(
         system=system_prompt,
@@ -256,42 +275,57 @@ def answer_with_context(question: str, passages: List[Tuple[str,float]], sql_df:
 llm = None if provider == 'disabled' else LLMClient(provider, model_name)
 
 if run_rag:
-    if not st.session_state.vector or not st.session_state.ingested:
+    if not st.session_state.ingested or not st.session_state.sql:
         answer_box.error("Please upload data and build the index first.")
     else:
-        hits = st.session_state.vector.search(q, k=top_k) if (use_rag and top_k>0) else []
+        # 1) Always propose SQL (LLM); fall back to heuristic if needed
+        sql_text = propose_sql(q, st.session_state.sql, llm)
+
+        # 2) Execute the SQL across the whole dataset
+        df_sql = None
+        try:
+            df_sql = st.session_state.sql.run(sql_text)
+        except Exception as e:
+            st.warning(f"Proposed SQL failed: {e}")
+
+        # 3) Retrieve RAG context (optional/top_k may be 0)
+        hits = st.session_state.vector.search(q, k=top_k) if (st.session_state.vector and top_k > 0) else []
         web_notes = maybe_web_notes(q, len(hits), use_web)
-        ans = answer_with_context(q, hits, None, web_notes, llm)
+
+        # 4) Answer using BOTH SQL result and RAG context
+        ans = answer_with_context(q, hits, df_sql, web_notes, llm)
         answer_box.markdown(ans)
+
+        # 5) Show SQL editor so you can modify and re-run
+        with st.expander("SQL (edit and re-run)"):
+            sql_edit = st.text_area("SQL", sql_text, height=180, key="sql_edit_rag")
+            if st.button("Re-run Edited SQL", key="rerun_sql_rag"):
+                try:
+                    df_sql = st.session_state.sql.run(sql_edit)
+                    st.dataframe(df_sql)
+                    # Re-answer with edited result
+                    ans2 = answer_with_context(q, hits, df_sql, web_notes, llm)
+                    answer_box.markdown(ans2)
+                except Exception as e:
+                    st.error(f"SQL error: {e}")
+            if df_sql is not None and not df_sql.empty:
+                # Quick visualization
+                try:
+                    _num = df_sql.select_dtypes(include='number').columns.tolist()
+                    _dates = [c for c in df_sql.columns
+                              if "date" in c.lower() or pd.api.types.is_datetime64_any_dtype(df_sql[c])]
+                    if _dates and _num:
+                        st.line_chart(df_sql.set_index(_dates[0])[_num[0]])
+                    elif len(_num) >= 2:
+                        st.bar_chart(df_sql[_num[:2]])
+                except Exception:
+                    pass
+
+        # 6) Optional: show retrieved chunks
         if hits:
             with st.expander("Retrieved chunks"):
                 for pid, score in hits:
                     st.write(f"**{pid}** (score={score:.3f})")
-
-if gen_sql:
-    if not st.session_state.sql:
-        st.warning("Build the index first (loads tables).")
-    else:
-        sql = propose_sql(q, st.session_state.sql, llm)
-        st.code(sql, language='sql')
-
-if exec_sql:
-    if not st.session_state.sql:
-        st.warning("Build the index first (loads tables).")
-    else:
-        sql = propose_sql(q, st.session_state.sql, llm)
-        st.code(sql, language='sql')
-        try:
-            df = st.session_state.sql.run(sql)
-            st.dataframe(df)
-        except Exception as e:
-            st.error(f"SQL error: {e}")
-            df = None
-        hits = st.session_state.vector.search(q, k=top_k) if (use_rag and st.session_state.vector and top_k>0) else []
-        web_notes = maybe_web_notes(q, len(hits), use_web)
-        ans = answer_with_context(q, hits, df, web_notes, llm)
-        answer_box.markdown(ans)
-
 st.divider()
 
 # --- Forecast panel ---
@@ -331,10 +365,10 @@ if st.session_state.ingested and st.session_state.ingested.tables:
 
     if st.button("Run Forecast"):
         try:
-            fc = Forecaster(df, dcol, vcol, season if season>0 else None)
-            out, diag = fc.fit_predict(model=model, horizon=horizon)
+            fc = Forecaster(df, dcol, vcol)
+            out, diag = fc.fit_predict(model=model, horizon=horizon, season=(season or None))
             st.write("**Diagnostics**", diag)
-            st.line_chart(out.set_index('Date')['forecast'])
+            st.line_chart(out.set_index('dcol')['forecast'])
             st.dataframe(out)
         except Exception as e:
             st.error(f"Forecast failed: {e}")

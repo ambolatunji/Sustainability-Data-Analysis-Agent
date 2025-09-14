@@ -14,6 +14,37 @@ class IngestedData:
     tables: Dict[str, pd.DataFrame]
     corpus_docs: List[Tuple[str, str]]  # (doc_id, text)
 
+# add near the top
+def _df_to_chunks(df: pd.DataFrame, name: str, sheet: str | None, rows_per_chunk: int = 8000):
+    chunks = []
+    for start in range(0, len(df), rows_per_chunk):
+        part = df.iloc[start:start+rows_per_chunk]
+        chunk_id = f"{name}#{sheet or 'table'}@rows={start}-{start+len(part)-1}"
+        chunks.append((chunk_id, clean_text(part.to_csv(index=False))))
+    return chunks
+
+# update _read_csv
+def _read_csv(file: io.BytesIO, name: str):
+    df = pd.read_csv(file)
+    df.columns = [str(c).strip() for c in df.columns]
+    docs = _df_to_chunks(df, name, sheet=None, rows_per_chunk=8000)
+    return docs, [df]
+
+# update _read_excel
+def _read_excel(file: io.BytesIO, name: str):
+    xl = pd.ExcelFile(file)
+    docs, tables = [], []
+    for sheet in xl.sheet_names:
+        try:
+            df = xl.parse(sheet)
+        except Exception:
+            continue
+        df.columns = [str(c).strip() for c in df.columns]
+        df.name = f"{name}:{sheet}"
+        tables.append(df)
+        docs.extend(_df_to_chunks(df, name, sheet=sheet, rows_per_chunk=8000))
+    return docs, tables
+
 
 def _read_pdf(file: io.BytesIO, name: str):
     reader = PdfReader(file)
@@ -26,30 +57,6 @@ def _read_pdf(file: io.BytesIO, name: str):
         if txt.strip():
             docs.append((f"{name}#page={i+1}", clean_text(txt)))
     return docs, []
-
-
-def _read_csv(file: io.BytesIO, name: str):
-    df = pd.read_csv(file)
-    df.columns = [str(c).strip() for c in df.columns]
-    df = resolve_duplicate_columns(df)
-    return [(f"{name}#table", clean_text(df.to_csv(index=False)))], [df]
-
-
-def _read_excel(file: io.BytesIO, name: str):
-    xl = pd.ExcelFile(file)
-    docs, tables = [], []
-    for sheet in xl.sheet_names:
-        try:
-            df = xl.parse(sheet)
-        except Exception:
-            continue
-        df.columns = [str(c).strip() for c in df.columns]
-        df = resolve_duplicate_columns(df)
-        df.name = f"{name}:{sheet}"
-        tables.append(df)
-        docs.append((f"{name}#{sheet}", clean_text(df.to_csv(index=False))))
-    return docs, tables
-
 
 def ingest_files(uploaded_files) -> IngestedData:
     tables: Dict[str, pd.DataFrame] = {}

@@ -23,6 +23,15 @@ def load_sbert(model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> Se
     return SentenceTransformer(model_name)
 
 
+def smart_to_numeric(s: pd.Series) -> pd.Series:
+    # Handles commas, spaces, percents, parentheses-negatives
+    t = s.astype(str).str.strip()
+    t = t.str.replace(",", "", regex=False)
+    t = t.str.replace("%", "", regex=False)
+    t = t.str.replace("(", "-", regex=False).str.replace(")", "", regex=False)
+    return pd.to_numeric(t, errors="coerce")
+
+
 def resolve_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     """If duplicate column names exist, merge them:
     - numeric dups → row-wise sum
